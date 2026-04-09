@@ -2,7 +2,7 @@
 title: "What Gradients Actually Tell a Model"
 subtitle: "Learning is just organized falling"
 author: "Ashish Srivastava"
-date: "2026-05-01"
+date: "2026-04-10"
 categories: [gradients, optimization, foundations]
 draft: false
 bibliography: ../../references.bib
