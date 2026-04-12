@@ -22,6 +22,10 @@ SCENES = {
         "file": "post_01/scenes.py",
         "scenes": ["UpdateRuleDissected", "GradientForces", "GradientFingerprint"],
     },
+    "post_02": {
+        "file": "post_02/scenes.py",
+        "scenes": ["PerSampleVotes", "CurvatureAmplifier", "FingerprintDetector"],
+    },
 }
 
 

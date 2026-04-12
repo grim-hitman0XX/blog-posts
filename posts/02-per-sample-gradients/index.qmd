@@ -1,10 +1,301 @@
 ---
 title: "How One Data Point Steers the Entire Model"
-subtitle: "Cooking something up..."
+subtitle: "Some data points pull harder than others"
 author: "Ashish Srivastava"
 date: "2026-04-12"
 categories: [gradients, privacy, per-sample]
 draft: false
+bibliography: ../../references.bib
+format:
+  html:
+    code-fold: true
+jupyter: python3
 ---
 
-*Cooking something up...*
+::: {.callout-note}
+This is **Part 2** of a 6-part series on *From Gradients to Correlated Noise*.
+[View the series home →](../../index.qmd)
+:::
+
+## The Slope Had Voices
+
+In the last post, we showed that the gradient — that vector of numbers you compute every training step — is not just a direction to roll the ball. It's a communication channel from the data to the model, with enough bandwidth to reconstruct human faces.
+
+We ended with a claim: the slope under the ball is a tug of war between data points, and some of them pull far harder than others.
+
+Today, we separate the ropes.
+
+We're going to decompose that net force into individual contributions, measure how much each one matters, and discover something uncomfortable: a handful of training examples dominate your model's behavior. They leave fingerprints so strong that you can trace the model's decisions back to specific data points — and that traceability is both a powerful diagnostic tool and a privacy catastrophe.
+
+## Separating the Ropes
+
+Remember the picture from Post 1: you're a ball on a mountain in pitch darkness, and the slope you feel is the average of forces from every data point in the batch. Each one tugs the ball in its preferred direction. The gradient you experience is the net result.
+
+$$\nabla_\theta \mathcal{L} = \frac{1}{|B|} \sum_{i \in B} \underbrace{\nabla_\theta \ell(z_i, \theta)}_{g_i}$$
+
+$g_i$ is the **per-sample gradient** — data point $z_i$'s individual force on the ball. The direction it wants you to roll.
+
+Now here's something the batch gradient hides from you: those forces are rarely pulling in the same direction.
+
+A cat photo the model already classifies correctly? Gentle tug — barely any force, aligned with the majority. *I'm fine, leave me alone.*
+
+A blurry, mislabeled image the model gets totally wrong? Hard yank — pulling the ball sideways, demanding a course correction.
+
+A rare data point — a medical scan unlike anything else in the training set? It doesn't just pull differently. It pulls in a direction nobody else is pulling. And because that direction is so unusual, it can shift the net force even as a single rope in a crowd of thousands.
+
+**Two batches can have the exact same average gradient and look completely different inside.** One might be a quiet consensus — every data point nudging in roughly the same direction. The other might be a screaming match where the average is a fragile compromise between opposing forces. The mean tells you nothing about the disagreement underneath.
+
+This matters because the disagreement structure is where the interesting stuff lives: the outliers, the hard cases, the data points that are about to become privacy problems.
+
+<video autoplay loop muted playsinline style="width:100%; border-radius:8px; margin:1.5em 0;">
+  <source src="../../animations/media/videos/scenes/1080p60/PerSampleVotes.mp4" type="video/mp4">
+</video>
+
+```{python}
+#| label: fig-persample-norms
+#| fig-cap: "Per-sample gradient norms for a mini-batch of 128 examples. Most contribute a small, gentle nudge. A handful pull dramatically harder — the heavy tail of influence."
+
+import plotly.graph_objects as go
+import numpy as np
+
+np.random.seed(42)
+
+# Simulate per-sample gradient norms: mostly small, heavy tail
+n_samples = 128
+normal_norms = np.abs(np.random.normal(0.3, 0.15, int(n_samples * 0.9)))
+outlier_norms = np.abs(np.random.normal(1.8, 0.6, int(n_samples * 0.1)))
+all_norms = np.concatenate([normal_norms, outlier_norms])
+np.random.shuffle(all_norms)
+all_norms = np.sort(all_norms)[::-1]
+
+colors = ['#FF6B6B' if n > 1.0 else '#4ECDC4' for n in all_norms]
+
+fig = go.Figure()
+
+fig.add_trace(go.Bar(
+    x=list(range(len(all_norms))),
+    y=all_norms,
+    marker_color=colors,
+    name='Per-sample gradient norm',
+    hovertemplate='Sample %{x}<br>‖gᵢ‖ = %{y:.3f}<extra></extra>'
+))
+
+fig.update_layout(
+    xaxis_title='Training example (sorted by gradient norm)',
+    yaxis_title='‖gᵢ‖ (per-sample gradient norm)',
+    template='plotly_white',
+    width=750, height=400,
+    margin=dict(l=60, r=30, t=30, b=60),
+    showlegend=False,
+    annotations=[
+        dict(
+            x=5, y=all_norms[5] + 0.15,
+            text='Heavy hitters',
+            showarrow=True, arrowhead=2,
+            ax=40, ay=-30,
+            font=dict(color='#FF6B6B', size=13)
+        ),
+        dict(
+            x=80, y=all_norms[80] + 0.15,
+            text='The quiet majority',
+            showarrow=True, arrowhead=2,
+            ax=40, ay=-30,
+            font=dict(color='#4ECDC4', size=13)
+        )
+    ]
+)
+
+fig.show()
+```
+
+That heavy tail isn't noise. It's signal. The red bars — the data points with the largest per-sample gradients — are the ones yanking the ball hardest. They have outsized influence on where the model ends up.
+
+The question is: *how much* influence exactly? And can we measure it beyond raw gradient norms?
+
+## The Simplest Question First
+
+Here's the most natural thing to ask: if I want to know which training example is responsible for a particular prediction, why not just check whose gradient pointed in the same direction as the model's actual update?
+
+That's essentially what TracIn does [@pruthi2020tracin]. For a given test example $z'$, it scores each training example $z$ by how much their gradients aligned over the course of training:
+
+$$\text{TracIn}(z, z') = \sum_{t=1}^{T} \eta_t \; \nabla_\theta \ell(z, \theta_t) \cdot \nabla_\theta \ell(z', \theta_t)$$
+
+Read that as: "How often did this training example push the ball in a direction that helped (or hurt) this test prediction?"
+
+A large positive score means the training example consistently pushed the model toward getting the test example right — a **proponent**. A large negative score means it consistently pushed the model *away* from the right answer — an **opponent** that actively hurts this prediction.
+
+The beauty of TracIn is its simplicity. It's dot products. You can compute it in a few lines of PyTorch, and it works surprisingly well. For most practical purposes — finding which training images shaped a prediction, debugging mislabeled data, understanding why a model gets a specific test case wrong — this is enough.
+
+```{python}
+#| label: fig-influence-scores
+#| fig-cap: "Influence scores of 500 training examples on a single test prediction. A handful of proponents strongly support the prediction. A few opponents actively fight it. The vast majority are bystanders."
+
+import plotly.graph_objects as go
+import numpy as np
+
+np.random.seed(123)
+
+n_train = 500
+
+# Simulate influence scores: mostly near zero, heavy tails
+scores = np.random.normal(0, 0.05, n_train)
+proponent_idx = np.random.choice(n_train, 8, replace=False)
+scores[proponent_idx] = np.random.uniform(0.3, 0.8, 8)
+opponent_idx = np.random.choice(
+    [i for i in range(n_train) if i not in proponent_idx], 5, replace=False
+)
+scores[opponent_idx] = np.random.uniform(-0.6, -0.2, 5)
+
+sorted_idx = np.argsort(scores)[::-1]
+sorted_scores = scores[sorted_idx]
+
+colors = []
+for s in sorted_scores:
+    if s > 0.15:
+        colors.append('#2ecc71')
+    elif s < -0.1:
+        colors.append('#e74c3c')
+    else:
+        colors.append('#95a5a6')
+
+fig = go.Figure()
+
+fig.add_trace(go.Bar(
+    x=list(range(len(sorted_scores))),
+    y=sorted_scores,
+    marker_color=colors,
+    hovertemplate='Rank %{x}<br>Influence = %{y:.4f}<extra></extra>'
+))
+
+fig.add_hline(y=0, line_dash='dash', line_color='white', line_width=0.5)
+
+fig.update_layout(
+    xaxis_title='Training example (sorted by influence)',
+    yaxis_title='Influence score on test prediction',
+    template='plotly_white',
+    width=750, height=400,
+    margin=dict(l=60, r=30, t=30, b=60),
+    showlegend=False,
+    annotations=[
+        dict(
+            x=3, y=sorted_scores[3] + 0.06,
+            text='Proponents',
+            showarrow=False,
+            font=dict(color='#2ecc71', size=13)
+        ),
+        dict(
+            x=len(sorted_scores) - 3, y=sorted_scores[-3] - 0.08,
+            text='Opponents',
+            showarrow=False,
+            font=dict(color='#e74c3c', size=13)
+        ),
+        dict(
+            x=250, y=0.12,
+            text='The vast middle: barely matters',
+            showarrow=False,
+            font=dict(color='#95a5a6', size=12)
+        )
+    ]
+)
+
+fig.show()
+```
+
+Look at that distribution. Out of 500 training examples, maybe a dozen actually matter for this prediction. The rest are bystanders — they could be in the training set or not, and this particular prediction would barely change.
+
+That's the first surprise: **influence is absurdly concentrated.** A tiny fraction of your training data does most of the work for any given prediction.
+
+But TracIn misses something. It treats every direction in parameter space the same — as if the loss landscape were a flat, featureless plane. It isn't.
+
+## The Shape of the Chamber
+
+Go back to the mountain. The mountain has curvature. Some directions are knife-edges — a small step dramatically changes the loss. Other directions are broad plateaus — you could walk for miles and barely notice a difference. The curvature at any point is encoded in the **Hessian matrix** $H$, the matrix of second derivatives of the loss.
+
+Now think about what this means for influence. Two data points might pull with identical strength — same gradient norm. But if one pulls along a knife-edge direction and the other along a plateau, their actual influence on the model is wildly different. The plateau pull gets amplified — there's nothing resisting it, so the parameters shift easily. The knife-edge pull gets dampened — the steep walls push back, and the parameters barely budge.
+
+Think of it like acoustics. In a flat, open room, every voice carries equally. But in a cathedral with alcoves and resonant chambers, certain frequencies get amplified while others get swallowed by the walls. The Hessian is the shape of the room. Its eigenvalues are the resonant frequencies.
+
+This is exactly what **influence functions** formalize [@koh2017understanding]. And they're not a new idea — R. Dennis Cook invented the same logic for linear regression in 1977 [@cook1977detection], asking "what happens to my fitted values if I delete one observation?" Koh and Liang's contribution was making this work (approximately) for neural networks, forty years later.
+
+The formula:
+
+$$I_{\text{up,params}}(z) \approx -H_{\hat{\theta}}^{-1} \, \nabla_\theta \mathcal{L}(z, \hat{\theta})$$
+
+Three pieces, each with a clear meaning in our mountain picture:
+
+- $\nabla_\theta \mathcal{L}(z, \hat{\theta})$ — the **pull** of data point $z$. Its per-sample gradient — the direction it wants the ball to roll. Same object we've been looking at all post.
+
+- $H_{\hat{\theta}}^{-1}$ — the **curvature rescaler**. It amplifies forces along flat directions — where the landscape offers no resistance and the parameters slide easily — and dampens forces along steep directions — where the curvature pushes back. Think of it as the landscape's *responsiveness*: the flatter the terrain, the further a push carries.
+
+- The minus sign — **removal, not addition**. We're estimating what happens if we *remove* $z$ from the training set. Removing a data point reverses its pull.
+
+In plain English: the effect of removing one data point from your training set is approximately equal to its gradient, rescaled by the curvature of the landscape at the converged solution.
+
+<video autoplay loop muted playsinline style="width:100%; border-radius:8px; margin:1.5em 0;">
+  <source src="../../animations/media/videos/scenes/1080p60/CurvatureAmplifier.mp4" type="video/mp4">
+</video>
+
+::: {.callout-tip}
+## The Key Insight
+Influence is not just about how hard you pull. It's about *where you're pulling*. A gentle push on an ice rink (gradient along a flat, unconstrained direction) moves the ball further than a hard shove against a cliff wall (gradient along a steep, tightly curved direction). The Hessian determines where the landscape resists and where it yields.
+:::
+
+::: {.callout-note}
+## For the curious
+The formula comes from a first-order Taylor expansion of the leave-one-out retraining objective. If we weight data point $z$ by a small $\epsilon$ and ask how the optimal parameters $\hat{\theta}$ shift, the implicit function theorem gives us $\frac{d\hat{\theta}}{d\epsilon} = -H_{\hat{\theta}}^{-1} \nabla_\theta \mathcal{L}(z, \hat{\theta})$. The Hessian inverse acts as a propagator — it translates a local perturbation (one data point's gradient) into a global effect (how much the converged parameters shift). See [@koh2017understanding] for the full derivation.
+:::
+
+## The Fingerprint That Won't Wash Off
+
+Let's bring everything back to the thread running through this series.
+
+In Post 1, we showed that the gradient is a communication channel from data to model — one with enough bandwidth to reconstruct faces. Now we've shown something more specific: the channel doesn't carry a single generic signal. It carries **individual fingerprints** from each data point, layered on top of each other.
+
+Here's what we've established:
+
+- **The gradient decomposes into per-sample forces.** Each data point contributes its own pull on the ball, superimposed in the net gradient. The batch gradient is a lossy compression of $N$ individual signals.
+
+- **Influence is heavy-tailed.** A small fraction of training examples dominate the model's behavior on any given prediction. The rest are background noise.
+
+- **The landscape amplifies some voices.** Through the Hessian, data points whose gradients align with high-curvature directions have outsized influence — far beyond what their raw gradient magnitude would suggest.
+
+- **The fingerprints are traceable.** Even with tools as simple as dot products, we can trace model predictions back to specific training examples with surprising accuracy.
+
+This is a privacy problem that goes deeper than any particular attack or vulnerability. It's structural. You cannot train a model on data without the data influencing the model, and that influence is — in principle — detectable. The per-sample gradient is the unit of influence, the channel through which each training example whispers (or shouts) its preferences into the model's parameters. And right now, there's nothing stopping someone from listening.
+
+<video autoplay loop muted playsinline style="width:100%; border-radius:8px; margin:1.5em 0;">
+  <source src="../../animations/media/videos/scenes/1080p60/FingerprintDetector.mp4" type="video/mp4">
+</video>
+
+Here's a detail to file away for later: the per-sample gradient norm $\|g_i\|$ — the strength of each data point's pull — is *exactly* the quantity that DP-SGD clips. The defense against these fingerprints starts by capping how hard any single data point can pull on the ball. But that's Post 5.
+
+## The Question We Haven't Asked
+
+We've shown that individual data points leave measurable fingerprints on the model. We've measured their influence, and we've seen the heavy tail — a few data points matter enormously.
+
+But we haven't asked the most uncomfortable question: **just how faithful are those fingerprints?**
+
+Can a model remember a data point *exactly* — not just its influence direction, but its actual content?
+
+In 2017, Zhang, Bengio, Hardt, Recht, and Vinyals ran an experiment that should have been a fire alarm for the entire field [@zhang2017understanding]. They took a standard neural network — nothing exotic, an architecture you could train in an afternoon — and fed it images with completely random labels. No pattern to learn. No structure to exploit. Pure noise.
+
+The network fit them perfectly. Every. Single. One.
+
+A model that can memorize pure noise can memorize anything. Your medical records. Your browsing history. Your face. And it won't show up in the training loss — the loss goes down just as smoothly whether the labels are real or random.
+
+Then in 2021, Carlini and colleagues showed this wasn't just a theoretical concern [@carlini2021extracting]. They typed carefully chosen prompts into GPT-2 — a model trained on internet text — and the model responded with real people's names, email addresses, and phone numbers. Verbatim. Copied directly from the training data.
+
+The fingerprints aren't just detectable. They're permanent recordings.
+
+And here's the thing that makes this truly unsettling: some of that memorization isn't a bug. It's a *mathematical necessity*. Feldman showed that for data points in the long tail of the distribution — the rare, unusual examples that sit far from any cluster — the model *must* memorize them to achieve good generalization on similar future examples [@feldman2020does]. Memorization isn't always a failure of regularization. Sometimes it's the price of learning.
+
+In the next part, we'll look at exactly how deep that memorization goes — why neural networks can fit pure noise, why some training examples get burned permanently into the weights, and why that's both necessary and dangerous.
+
+::: {.series-nav}
+[← Post 1](../01-what-gradients-tell/index.qmd){.prev}
+:::
+
+## References
+
+::: {#refs}
+:::

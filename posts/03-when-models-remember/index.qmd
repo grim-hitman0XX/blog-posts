@@ -1,0 +1,15 @@
+---
+title: "When Models Remember Too Much"
+subtitle: "What if your model passed the exam by memorizing the answer key?"
+author: "Ashish Srivastava"
+date: "2026-04-18"
+categories: [memorization, privacy, generalization]
+draft: false
+bibliography: ../../references.bib
+format:
+  html:
+    code-fold: true
+jupyter: python3
+---
+
+*Cooking something up...*

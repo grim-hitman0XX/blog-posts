@@ -1,0 +1,12 @@
+{
+  "hash": "0c1ff3b2595ae4359db6718942913c1b",
+  "result": {
+    "engine": "jupyter",
+    "markdown": "---\ntitle: \"When Models Remember Too Much\"\nsubtitle: \"What if your model passed the exam by memorizing the answer key?\"\nauthor: \"Ashish Srivastava\"\ndate: \"2026-04-18\"\ncategories: [memorization, privacy, generalization]\ndraft: false\nbibliography: ../../references.bib\nformat:\n  html:\n    code-fold: true\njupyter: python3\n---\n\n*Cooking something up...*\n\n",
+    "supporting": [
+      "index_files"
+    ],
+    "filters": [],
+    "includes": {}
+  }
+}

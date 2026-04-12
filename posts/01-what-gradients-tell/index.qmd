@@ -304,6 +304,7 @@ In the next post, we'll decompose the gradient into individual contributions, me
 
 ::: {.series-nav}
 [← Series Home](../../index.qmd){.prev}
+[Post 2: How One Data Point Steers the Entire Model →](../02-per-sample-gradients/index.qmd){.next}
 :::
 
 ## References
